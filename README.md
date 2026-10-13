@@ -1,0 +1,55 @@
+# QuickLook.Plugin.QuickEdit
+
+A [QuickLook](https://github.com/QL-Win/QuickLook) plugin for changing a few words of a Markdown file without leaving its preview.
+
+- **Double-click** any rendered text (a paragraph, heading, list item, table cell, quote or code block) and type. Double-clicking a word selects it, so typing replaces it.
+- **Enter** or clicking elsewhere finishes the edit. **Esc** cancels it.
+- **Ctrl+S** writes the file. Nothing is saved unless you press it: close the preview and unsaved changes are gone.
+- **Ctrl+Z** / **Ctrl+Y** undo and redo finished edits. While editing, Ctrl+Z undoes typing as usual.
+- A small note in the corner says when there are unsaved changes.
+
+The preview is still QuickLook's own Markdown viewer, with its table of contents, highlighting and diagrams. The plugin only adds editing to it. Space, Esc and the arrow keys work as usual whenever you aren't typing.
+
+## How an edit reaches the file
+
+You edit the rendered text, but the plugin saves Markdown source. It works out the source change like this:
+
+1. Each rendered block is matched to the source lines it came from.
+2. The plugin generates candidate source changes for what you typed and renders each one.
+3. It keeps the first candidate that renders to exactly the text you typed and keeps the formatting around it. For example, renaming the bold word in `Most **subfolders** are` writes `Most **folders** are`.
+
+If no candidate fits, the edit is undone and the corner note says so. The plugin never guesses. Characters that Markdown would treat as formatting, such as `*` and `#`, are saved escaped (for example `\*`), so they show up as typed.
+
+Saving keeps the file's encoding and its line endings (CRLF or LF, line by line). If the file changed on disk after the preview opened, the plugin refuses to save.
+
+## Install
+
+Download `QuickLook.Plugin.QuickEdit.qlplugin` from [Releases](../../releases), select it in Explorer, press <kbd>Space</kbd>, click **Install**, then restart QuickLook.
+
+## Build
+
+No .NET SDK needed. `build.ps1` compiles with the C# compiler that ships with the .NET Framework, against your installed QuickLook's `QuickLook.Common.dll`, and writes `dist\QuickLook.Plugin.QuickEdit.qlplugin`.
+
+```powershell
+.\build.ps1                              # Microsoft Store QuickLook
+.\build.ps1 -QuickLookDir D:\QuickLook   # portable QuickLook
+.\build.ps1 -Install                     # also install it (exit QuickLook first)
+```
+
+`QuickEdit.js` is the editing code that runs in the preview page. `Plugin.cs` adds that script to each Markdown preview, reads and writes the file, and keeps QuickLook's keyboard shortcuts out of the way while you type.
+
+## Caveats
+
+- QuickLook internals are reached by reflection:
+  - `ViewWindowManager._viewerWindow`
+  - `ViewerWindow._path` and `ContextObject`
+  - `WebpagePanel._webView`
+  - `KeystrokeDispatcher._lastInvalidKeyPressTick`
+
+  A QuickLook release that renames one of these turns that part off, and QuickLook's log says which. Tested on QuickLook 4.5.0.
+- A block containing math or a Mermaid diagram can't be edited.
+- Only Markdown files (`.md`, `.markdown` and the other extensions QuickLook's Markdown viewer reads, except `.mermaid` and `.mmd`).
+
+## License
+
+GPL-3.0, the same as QuickLook. See [LICENSE](LICENSE).
