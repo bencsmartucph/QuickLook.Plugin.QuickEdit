@@ -4,6 +4,9 @@ A [QuickLook](https://github.com/QL-Win/QuickLook) plugin for changing a few wor
 
 - **Double-click** any rendered text (a paragraph, heading, list item, table cell, quote or code block) and type. Double-clicking a word selects it, so typing replaces it.
 - **Enter** or clicking elsewhere finishes the edit. **Esc** cancels it.
+- **Enter at the end of a bullet** starts a new bullet below it, with the same indent and marker (numbered lists count on). Press Enter on the empty new bullet to stop. **Enter at the end of a paragraph or heading** starts a new paragraph.
+- **Delete all of a bullet's, paragraph's or heading's text** and press Enter or Backspace, and its lines are removed from the file.
+- **Ctrl+B / Ctrl+I** make the selected text, or the word at the caret, bold or italic. Press again to remove it. This also works on text selected with the mouse, without double-clicking first.
 - **Ctrl+S** writes the file. Nothing is saved unless you press it: close the preview and unsaved changes are gone.
 - **Ctrl+Z** / **Ctrl+Y** undo and redo finished edits. While editing, Ctrl+Z undoes typing as usual.
 - A small note in the corner says when there are unsaved changes.

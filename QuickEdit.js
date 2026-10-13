@@ -4,6 +4,9 @@
 // Double-click rendered text to edit it in place. Enter (or clicking away)
 // finishes the edit, Esc cancels it, Ctrl+S writes the file, Ctrl+Z / Ctrl+Y
 // undo and redo finished edits. Nothing is saved unless you press Ctrl+S.
+// Enter at the end of a bullet or paragraph starts a new one; emptying a
+// block removes it; Ctrl+B / Ctrl+I toggle bold and italic. New and removed
+// blocks, and formatting, go through the same render-and-check as text edits.
 //
 // How an edit gets back into the Markdown source:
 //  1. The page's own markdown-it instance re-renders the source with each
@@ -30,7 +33,7 @@
 
   function boot() {
     if (window.__qe || !ready()) return;
-    window.__qe = { version: "1.0.0" };
+    window.__qe = { version: "1.1.0" };
     init();
   }
 
@@ -113,7 +116,9 @@
       "#qe-pill.qe-error{color:var(--fgColor-danger,#d1242f)}",
       "#qe-pill kbd{font:11px 'Segoe UI',system-ui,sans-serif;padding:0 5px;border:1px solid var(--borderColor-default,#d0d7de);",
       "border-bottom-width:2px;border-radius:4px;background:var(--bgColor-muted,#f6f8fa)}",
-      "#qe-pill .qe-sep{opacity:.45}"
+      "#qe-pill .qe-sep{opacity:.45}",
+      ".qe-new{min-height:1.5em}",
+      ".qe-new:empty::before{content:'Type here';color:var(--fgColor-muted,#59636e);pointer-events:none}"
     ].join("");
     document.head.appendChild(style);
 
@@ -149,8 +154,11 @@
       if (kind === "saved") return setPill("qe-saved", "Saved", 1400);
       if (kind === "error") return setPill("qe-error", escapeHtml(message || "Couldn't save."), 4500);
       if (kind === "notice") return setPill("qe-error", escapeHtml(message), 3200);
+      if (editing && editing.pending) {
+        return setPill("qe-editing-state", "New " + (editing.pending.kind === "li" ? "item" : "paragraph") + SEP + kbd("Enter") + " next" + SEP + kbd("Esc") + " cancel");
+      }
       if (editing) {
-        var hint = kbd("Enter") + " done" + SEP + kbd("Esc") + " cancel";
+        var hint = kbd("Enter") + " done" + SEP + kbd("Esc") + " cancel" + SEP + kbd("Ctrl") + "+" + kbd("B") + " / " + kbd("I");
         if (keysWarned) hint += SEP + "QuickLook may react to Space/Enter";
         return setPill("qe-editing-state", "Editing" + SEP + hint);
       }
@@ -227,6 +235,7 @@
     function buildIndex() {
       var frag = renderFragment(T);
       var units = new WeakMap();
+      var list = [];
       var nodes = frag.querySelectorAll("[data-qe-line]");
       for (var i = 0; i < nodes.length; i++) {
         var det = nodes[i];
@@ -234,16 +243,18 @@
         var live = follow(preview, path);
         if (!live || live.tagName !== det.tagName) continue;
         var range = det.getAttribute("data-qe-line").split(",");
-        units.set(live, {
+        var unit = {
           live: live,
           det: det,
           path: path,
           start: +range[0],
           end: +range[1],
           code: det.hasAttribute("data-qe-code")
-        });
+        };
+        units.set(live, unit);
+        list.push(unit);
       }
-      index = { frag: frag, units: units, text: frag.textContent, signature: signature(frag) };
+      index = { frag: frag, units: units, list: list, text: frag.textContent, signature: signature(frag) };
     }
 
     function ensureIndex() {
@@ -251,11 +262,14 @@
       return index;
     }
 
+    var CONTAINERS = /^(UL|OL|BLOCKQUOTE|TABLE|THEAD|TBODY)$/;
+
     function unitFor(node) {
       var el = node && node.nodeType === 1 ? node : node && node.parentElement;
       var units = ensureIndex().units;
       while (el && el !== preview) {
-        if (units.has(el)) return units.get(el);
+        // Lists, quotes and tables hold blocks; only the blocks are edited.
+        if (units.has(el) && !CONTAINERS.test(el.tagName)) return units.get(el);
         el = el.parentElement;
       }
       return null;
@@ -628,6 +642,79 @@
     }
 
     // ---- editing -------------------------------------------------------------
+    //
+    // editing is one of
+    //   { unit, host, oldText, snapshot }   changing an existing block
+    //   { pending: { kind, after }, host }  a new list item or paragraph, not in the source until it has text
+
+    // Character offset of a DOM position within root's text.
+    function offsetIn(root, node, offset) {
+      var r = document.createRange();
+      r.setStart(root, 0);
+      try {
+        r.setEnd(node, offset);
+      } catch (e) {
+        return -1;
+      }
+      return r.toString().length;
+    }
+
+    function pointAt(root, offset) {
+      var walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+      var seen = 0;
+      var node;
+      var last = null;
+      while ((node = walker.nextNode())) {
+        if (seen + node.data.length >= offset) return { node: node, offset: offset - seen };
+        seen += node.data.length;
+        last = node;
+      }
+      return last ? { node: last, offset: last.data.length } : { node: root, offset: root.childNodes.length };
+    }
+
+    function rangeAt(root, start, end) {
+      var a = pointAt(root, start);
+      var b = pointAt(root, end);
+      var r = document.createRange();
+      r.setStart(a.node, a.offset);
+      r.setEnd(b.node, b.offset);
+      return r;
+    }
+
+    function unitAtLine(line, tag) {
+      var list = ensureIndex().list;
+      for (var i = 0; i < list.length; i++) if (list[i].start === line && list[i].det.tagName === tag) return list[i];
+      return null;
+    }
+
+    // Where typing goes for a block: the table cell holding the offset, the
+    // code element of a code block, or the block itself.
+    function hostFor(unit, offset) {
+      if (unit.det.tagName === "TR") {
+        var cells = unit.live.children;
+        for (var i = 0; i < cells.length; i++) {
+          var start = offsetIn(unit.live, cells[i], 0);
+          if (offset >= start && offset <= start + cells[i].textContent.length) return cells[i];
+        }
+        return cells[0] || unit.live;
+      }
+      if (unit.code) return unit.live.querySelector("code") || unit.live;
+      return unit.live;
+    }
+
+    function makeEditable(host) {
+      try {
+        host.contentEditable = "plaintext-only";
+      } catch (e) {
+        host.contentEditable = "true";
+      }
+      if (host.contentEditable !== "plaintext-only") host.contentEditable = "true";
+      host.spellcheck = false;
+      host.classList.add("qe-editing");
+      host.focus({ preventScroll: true });
+      host.addEventListener("blur", onBlur);
+      post("editing:1");
+    }
 
     function startEdit(unit, host, range, point) {
       if (editing) finish(true);
@@ -641,16 +728,7 @@
         oldText: unit.live.textContent,
         snapshot: unit.live.innerHTML
       };
-
-      try {
-        host.contentEditable = "plaintext-only";
-      } catch (e) {
-        host.contentEditable = "true";
-      }
-      if (host.contentEditable !== "plaintext-only") host.contentEditable = "true";
-      host.spellcheck = false;
-      host.classList.add("qe-editing");
-      host.focus({ preventScroll: true });
+      makeEditable(host);
 
       var sel = window.getSelection();
       if (range && host.contains(range.startContainer) && host.contains(range.endContainer)) {
@@ -664,9 +742,29 @@
           sel.addRange(caret);
         }
       }
+      updateStatus();
+    }
 
-      host.addEventListener("blur", onBlur);
-      post("editing:1");
+    // What Enter at the end of a block creates: a list item after a list
+    // item, a paragraph after a top-level paragraph or heading.
+    function nextKind(unit) {
+      var tag = unit.det.tagName;
+      if (tag === "LI") return { kind: "li", after: unit };
+      if (tag === "P" && unit.live.parentElement && unit.live.parentElement.tagName === "LI") {
+        var item = unitFor(unit.live.parentElement);
+        if (item && item.det.tagName === "LI") return { kind: "li", after: item };
+      }
+      if ((tag === "P" || /^H[1-6]$/.test(tag)) && unit.live.parentElement === preview) return { kind: "p", after: unit };
+      return null;
+    }
+
+    function startNew(next) {
+      if (!next || !next.after.live.isConnected) return;
+      var el = document.createElement(next.kind === "li" ? "li" : "p");
+      el.className = "qe-new";
+      next.after.live.insertAdjacentElement("afterend", el);
+      editing = { pending: next, host: el };
+      makeEditable(el);
       updateStatus();
     }
 
@@ -705,10 +803,105 @@
       index = null;
     }
 
+    function commit(src, frag, sameShape, unit) {
+      undoStack.push(T);
+      redoStack = [];
+      setSource(src);
+      if (!(sameShape && unit && frag && patchUnit(unit, frag))) renderAll();
+      updateStatus();
+    }
+
+    function squash(s) {
+      return s.replace(/\s+/g, "");
+    }
+
+    // Typed text as source: Markdown punctuation escaped, and nothing at the
+    // start of a line that would turn it into a list, heading or quote.
+    function asLiteral(text) {
+      return escapeMarkdown(text).replace(/^(\s*)([-+]|\d+[.)]|>)(?=\s|$)/, "$1\\$2");
+    }
+
+    // A new list item or paragraph after `after`, holding `text`.
+    function insertBlock(kind, after, text) {
+      var lines = T.split("\n");
+      var at = after.end;
+      while (at > after.start + 1 && /^\s*$/.test(lines[at - 1] || "")) at--;
+
+      var build;
+      if (kind === "li") {
+        var m = /^(\s*)([-*+]|(\d+)([.)]))[ \t]+/.exec(lines[after.start] || "");
+        if (!m) return null;
+        var marker = m[3] ? String(+m[3] + 1) + m[4] : m[2];
+        build = function (v) {
+          return [m[1] + marker + " " + v];
+        };
+      } else {
+        build = function (v) {
+          var out = ["", v];
+          if (lines[at] !== undefined && !/^\s*$/.test(lines[at])) out.push("");
+          return out;
+        };
+      }
+      var newLine = kind === "li" ? at : at + 1;
+      var tag = kind === "li" ? "LI" : "P";
+
+      var end = textOffset(index.frag, after.det) + after.det.textContent.length;
+      var expected = squash(index.text.substring(0, end) + text + index.text.substring(end));
+      var variants = [text];
+      if (asLiteral(text) !== text) variants.push(asLiteral(text));
+
+      for (var i = 0; i < variants.length; i++) {
+        var src = lines.slice(0, at).concat(build(variants[i]), lines.slice(at)).join("\n");
+        var frag;
+        try {
+          frag = renderFragment(src);
+        } catch (e) {
+          continue;
+        }
+        if (squash(frag.textContent) !== expected) continue;
+        var el = frag.querySelector('[data-qe-line^="' + newLine + ',"]');
+        if (!el || el.tagName !== tag || el.textContent.trim() !== text.trim()) continue;
+        return { src: src, line: newLine, tag: tag };
+      }
+      return null;
+    }
+
+    // An emptied list item, paragraph or heading: remove its lines.
+    function deleteBlock(unit) {
+      var lines = T.split("\n");
+      var start = unit.start;
+      var end = unit.end;
+      while (end > start + 1 && /^\s*$/.test(lines[end - 1] || "")) end--;
+      var count = end - start;
+      var blank = function (i) {
+        return i < 0 || (lines[i] !== undefined && /^\s*$/.test(lines[i]));
+      };
+      if (unit.det.tagName !== "LI" && blank(start - 1) && lines[end] !== undefined && blank(end)) count++;
+
+      var src = lines.slice(0, start).concat(lines.slice(start + count)).join("\n");
+      var offset = textOffset(index.frag, unit.det);
+      var expected = squash(index.text.substring(0, offset) + index.text.substring(offset + unit.det.textContent.length));
+      var frag;
+      try {
+        frag = renderFragment(src);
+      } catch (e) {
+        return null;
+      }
+      if (squash(frag.textContent) !== expected) return null;
+      if (frag.querySelectorAll("[data-qe-line]").length >= index.list.length) return null;
+      return { src: src };
+    }
+
+    function deletable(unit) {
+      return /^(LI|P|H[1-6])$/.test(unit.det.tagName) && !unit.live.closest("td, th, blockquote");
+    }
+
     // keep: true applies the edit to the source, false throws it away.
-    function finish(keep) {
+    // opts.chain: Enter at the end of the block, so continue with a new one.
+    function finish(keep, opts) {
       var ed = editing;
       if (!ed) return;
+      opts = opts || {};
       ed.finishing = true;
       editing = null;
       endHost(ed);
@@ -716,17 +909,32 @@
       if (document.activeElement === ed.host) ed.host.blur();
       window.getSelection().removeAllRanges();
 
-      var newText = ed.unit.live.textContent;
+      if (ed.pending) return finishNew(ed, keep, opts);
+
+      var unit = ed.unit;
+      var newText = unit.live.textContent;
+      var line = unit.start;
+      var tag = unit.det.tagName;
+
       if (!keep || newText === ed.oldText) {
         restore(ed);
         updateStatus();
+        if (keep && opts.chain) startNew(nextKind(unitAtLine(line, tag) || unit));
         return;
       }
 
+      ensureIndex();
       var result = null;
       try {
-        ensureIndex();
-        result = applyEdit(ed.unit, ed.oldText, newText);
+        if (!newText.trim() && deletable(unit)) {
+          var removed = deleteBlock(unit);
+          if (removed) {
+            commit(removed.src);
+            return;
+          }
+        } else {
+          result = applyEdit(unit, ed.oldText, newText);
+        }
       } catch (e) {
         result = null;
       }
@@ -737,11 +945,165 @@
         return;
       }
 
-      undoStack.push(T);
-      redoStack = [];
-      setSource(result.src);
-      if (!(result.sameShape && patchUnit(ed.unit, result.frag))) renderAll();
-      updateStatus();
+      commit(result.src, result.frag, result.sameShape, unit);
+      if (opts.chain) {
+        var again = unitAtLine(line, tag);
+        if (again) startNew(nextKind(again));
+      }
+    }
+
+    function finishNew(ed, keep, opts) {
+      var text = ed.host.textContent;
+      if (ed.host.parentNode) ed.host.parentNode.removeChild(ed.host);
+      if (!keep || !text.trim()) {
+        updateStatus();
+        return;
+      }
+      ensureIndex();
+      var after = unitAtLine(ed.pending.after.start, ed.pending.after.det.tagName);
+      var result = after ? insertBlock(ed.pending.kind, after, text) : null;
+      if (!result) {
+        updateStatus("notice", "Couldn't add that to the file, so it was dropped.");
+        return;
+      }
+      commit(result.src);
+      if (opts.chain) {
+        var added = unitAtLine(result.line, result.tag);
+        if (added) startNew(nextKind(added));
+      }
+    }
+
+    function caretAtEnd(host) {
+      var sel = window.getSelection();
+      if (!sel.rangeCount || !sel.isCollapsed) return false;
+      var r = sel.getRangeAt(0);
+      if (!host.contains(r.endContainer)) return false;
+      var own = host.textContent;
+      var nested = host.querySelector(":scope > ul, :scope > ol");
+      if (nested) own = own.substring(0, offsetIn(host, nested, 0));
+      return offsetIn(host, r.endContainer, r.endOffset) >= own.replace(/\s+$/, "").length;
+    }
+
+    // ---- bold and italic -----------------------------------------------------
+
+    var STYLES = {
+      b: { tags: "STRONG, B", markers: ["**", "__"], name: "bold" },
+      i: { tags: "EM, I", markers: ["*", "_"], name: "italic" }
+    };
+
+    // Ctrl+B / Ctrl+I: wrap the selection (or the word at the caret) in
+    // markers, or remove them when it is already formatted that way.
+    function format(kind) {
+      var sel = window.getSelection();
+      if (!sel.rangeCount || (editing && editing.pending)) return;
+      var range = sel.getRangeAt(0);
+      var unit = editing ? editing.unit : unitFor(range.commonAncestorContainer);
+      if (!unit || !unit.live.contains(range.commonAncestorContainer) || unit.code) return;
+
+      var text = unit.live.textContent;
+      var s = offsetIn(unit.live, range.startContainer, range.startOffset);
+      var e = offsetIn(unit.live, range.endContainer, range.endOffset);
+      if (s < 0 || e < 0) return;
+      if (s === e) {
+        while (s > 0 && /[\p{L}\p{N}_]/u.test(text[s - 1])) s--;
+        while (e < text.length && /[\p{L}\p{N}_]/u.test(text[e])) e++;
+      }
+      while (s < e && /\s/.test(text[s])) s++;
+      while (e > s && /\s/.test(text[e - 1])) e--;
+      if (s === e) return;
+
+      var line = unit.start;
+      var tag = unit.det.tagName;
+      if (editing) finish(true);
+      var u = unitAtLine(line, tag);
+      if (!u || u.live.textContent !== text || !editable(u)) return;
+
+      var result = null;
+      try {
+        result = toggleStyle(u, s, e, STYLES[kind]);
+      } catch (err) {
+        result = null;
+      }
+      if (!result) return refuse("Couldn't make that " + STYLES[kind].name + " here.");
+      commit(result.src, result.frag, true, u);
+
+      var again = unitAtLine(line, tag);
+      if (again) {
+        var host = hostFor(again, s);
+        startEdit(again, host, rangeAt(again.live, s, e));
+      }
+    }
+
+    function toggleStyle(unit, s, e, style) {
+      var starts = lineStarts(T);
+      var segStart = starts[unit.start] != null ? starts[unit.start] : T.length;
+      var segEnd = starts[unit.end] != null ? starts[unit.end] : T.length;
+      var seg = T.substring(segStart, segEnd);
+      var head = T.substring(0, segStart);
+      var foot = T.substring(segEnd);
+      var text = unit.det.textContent;
+      var m = align(text, seg);
+
+      function styled(root) {
+        var found = [];
+        var els = root.querySelectorAll(style.tags);
+        for (var i = 0; i < els.length; i++) {
+          var a = textOffset(root, els[i]);
+          found.push({ a: a, b: a + els[i].textContent.length });
+        }
+        return found;
+      }
+
+      var existing = styled(unit.det);
+      var covering = null;
+      existing.forEach(function (r) {
+        if (r.a <= s && e <= r.b) covering = r;
+      });
+
+      var candidates = [];
+      if (covering) {
+        var a0 = atNext(m, covering.a);
+        var b0 = afterPrevious(m, covering.b);
+        style.markers.forEach(function (mk) {
+          for (var a = a0; a != null && a >= mk.length && a >= a0 - 2; a--) {
+            for (var b = b0; b != null && b + mk.length <= seg.length && b <= b0 + 2; b++) {
+              if (seg.substr(a - mk.length, mk.length) === mk && seg.substr(b, mk.length) === mk)
+                candidates.push(seg.substring(0, a - mk.length) + seg.substring(a, b) + seg.substring(b + mk.length));
+            }
+          }
+        });
+      } else {
+        var as = [atNext(m, s), afterPrevious(m, s)];
+        var bs = [afterPrevious(m, e), atNext(m, e)];
+        style.markers.forEach(function (mk) {
+          as.forEach(function (a) {
+            bs.forEach(function (b) {
+              if (a != null && b != null && a <= b) candidates.push(seg.substring(0, a) + mk + seg.substring(a, b) + mk + seg.substring(b));
+            });
+          });
+        });
+      }
+
+      for (var i = 0; i < candidates.length; i++) {
+        var src = head + candidates[i] + foot;
+        var frag;
+        try {
+          frag = renderFragment(src);
+        } catch (err) {
+          continue;
+        }
+        if (frag.textContent !== index.text || signature(frag) !== index.signature) continue;
+        var det = follow(frag, unit.path);
+        if (!det) continue;
+        var after = styled(det);
+        var ok = covering
+          ? after.length === existing.length - 1
+          : after.some(function (r) {
+              return r.a === s && r.b === e;
+            });
+        if (ok) return { src: src, frag: frag };
+      }
+      return null;
     }
 
     function undo() {
@@ -834,43 +1196,62 @@
       true
     );
 
+    function stop(e) {
+      e.preventDefault();
+      e.stopImmediatePropagation();
+    }
+
     window.addEventListener(
       "keydown",
       function (e) {
         if (e.isComposing) return;
         var key = e.key;
         var ctrl = e.ctrlKey || e.metaKey;
+        var letter = key.length === 1 ? key.toLowerCase() : "";
 
-        if (ctrl && !e.altKey && (key === "s" || key === "S")) {
-          e.preventDefault();
-          e.stopImmediatePropagation();
+        if (ctrl && !e.altKey && letter === "s") {
+          stop(e);
           save();
           return;
         }
+        if (ctrl && !e.altKey && !e.shiftKey && (letter === "b" || letter === "i") && fileState === "ok") {
+          if (editing || !window.getSelection().isCollapsed) {
+            stop(e);
+            format(letter);
+            return;
+          }
+        }
 
         if (editing) {
-          if (key === "Enter" && editing.unit.code && e.shiftKey) {
-            e.preventDefault();
-            e.stopImmediatePropagation();
+          if (key === "Enter" && editing.unit && editing.unit.code && e.shiftKey) {
+            stop(e);
             document.execCommand("insertText", false, "\n");
             return;
           }
+          if (key === "Enter" && !e.shiftKey) {
+            stop(e);
+            var chain = editing.pending ? true : !!nextKind(editing.unit) && caretAtEnd(editing.host);
+            finish(true, { chain: chain });
+            return;
+          }
           if (key === "Enter" || key === "Tab") {
-            e.preventDefault();
-            e.stopImmediatePropagation();
+            stop(e);
             finish(true);
             return;
           }
           if (key === "Escape") {
-            e.preventDefault();
-            e.stopImmediatePropagation();
+            stop(e);
             finish(false);
+            return;
+          }
+          if (key === "Backspace" && !editing.host.textContent.length) {
+            stop(e);
+            finish(true); // an emptied block goes; a new one is dropped
             return;
           }
           if (key === " " && !ctrl) {
             // The page cancels Space (it dismisses the preview); type it ourselves.
-            e.preventDefault();
-            e.stopImmediatePropagation();
+            stop(e);
             document.execCommand("insertText", false, " ");
             return;
           }
@@ -878,18 +1259,12 @@
           return;
         }
 
-        if (ctrl && !e.altKey && !e.shiftKey && (key === "z" || key === "Z")) {
-          if (undo()) {
-            e.preventDefault();
-            e.stopImmediatePropagation();
-          }
+        if (ctrl && !e.altKey && !e.shiftKey && letter === "z") {
+          if (undo()) stop(e);
           return;
         }
-        if (ctrl && !e.altKey && (key === "y" || key === "Y" || (e.shiftKey && (key === "z" || key === "Z")))) {
-          if (redo()) {
-            e.preventDefault();
-            e.stopImmediatePropagation();
-          }
+        if (ctrl && !e.altKey && (letter === "y" || (e.shiftKey && letter === "z"))) {
+          if (redo()) stop(e);
         }
       },
       true
