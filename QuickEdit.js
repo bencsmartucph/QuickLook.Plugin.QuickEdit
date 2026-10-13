@@ -71,7 +71,7 @@
         if (data.indexOf("file:") === 0) {
           var file = data.substring(5).replace(/\r\n/g, "\n");
           if (file === savedT) fileState = "ok";
-          else block("Can't edit here: the preview doesn't match the file on disk. If it changed, reopen it.");
+          else block("Can't edit here: the preview's text doesn't match the file. Reopen it if it changed on disk; files with HTML entities such as &amp; can't be edited.");
         } else if (data.indexOf("nofile:") === 0) {
           block(data.substring(7));
         } else if (data === "saved") {
@@ -897,7 +897,7 @@
 
     // For tests and debugging.
     window.__qe.state = function () {
-      return { source: T, saved: savedT, dirty: T !== savedT, editing: !!editing, file: fileState, undo: undoStack.length };
+      return { source: T, saved: savedT, dirty: T !== savedT, editing: !!editing, file: fileState, undo: undoStack.length, keysGuard: !keysWarned };
     };
   }
 })();
