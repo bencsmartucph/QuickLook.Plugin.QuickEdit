@@ -1,6 +1,6 @@
 # QuickLook.Plugin.QuickEdit
 
-A [QuickLook](https://github.com/QL-Win/QuickLook) plugin for changing a few words of a Markdown file without leaving its preview.
+A [QuickLook](https://github.com/QL-Win/QuickLook) plugin for changing a few words of a Markdown or plain text file without leaving its preview.
 
 - **Double-click** any rendered text (a paragraph, heading, list item, table cell, quote or code block) and type. Double-clicking a word selects it, so typing replaces it.
 - **Enter** or clicking elsewhere finishes the edit. **Esc** cancels it.
@@ -12,6 +12,16 @@ A [QuickLook](https://github.com/QL-Win/QuickLook) plugin for changing a few wor
 - A small note in the corner says when there are unsaved changes.
 
 The preview is still QuickLook's own Markdown viewer, with its table of contents, highlighting and diagrams. The plugin only adds editing to it. Space, Esc and the arrow keys work as usual whenever you aren't typing.
+
+## Plain text files
+
+Files QuickLook shows in its text viewer (`.txt`, `.json`, `.ps1`, `.py`, `.ini`, logs and so on) can be edited too:
+
+- **Double-click** to start editing. The word you clicked is selected, so typing replaces it. From then on it behaves like a normal text editor: Enter adds a line and Ctrl+Z undoes.
+- **Ctrl+S** saves and stops editing. **Esc** stops editing and keeps your changes, unsaved; press Esc again to close the preview, which discards them.
+- The title bar shows whether you're editing or have unsaved changes.
+
+Saving keeps the file's encoding and line endings. Files the viewer shows differently from what's on disk can't be edited: over 5 MB (it shows only the first 5 MB), or converted for display.
 
 ## How an edit reaches the file
 
@@ -51,7 +61,7 @@ No .NET SDK needed. `build.ps1` compiles with the C# compiler that ships with th
 
   A QuickLook release that renames one of these turns that part off, and QuickLook's log says which. Tested on QuickLook 4.5.0.
 - A block containing math or a Mermaid diagram can't be edited.
-- Only Markdown files (`.md`, `.markdown` and the other extensions QuickLook's Markdown viewer reads, except `.mermaid` and `.mmd`).
+- Markdown editing covers `.md`, `.markdown` and the other extensions QuickLook's Markdown viewer reads, except `.mermaid` and `.mmd`. Text editing needs QuickLook's text viewer (`TextViewerPanel`).
 
 ## License
 

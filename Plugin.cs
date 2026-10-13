@@ -1,16 +1,18 @@
 // QuickLook.Plugin.QuickEdit
 // Copyright (C) 2026 Ben Smart. Licensed under the GNU GPL v3 or later (see LICENSE).
 //
-// Edit a few words of a Markdown file straight in its QuickLook preview:
-// double-click rendered text, type, press Enter; Ctrl+S writes the file.
-// Nothing is saved unless you press Ctrl+S.
+// Edit a few words of a Markdown or plain text file straight in its QuickLook
+// preview: double-click, type; Ctrl+S writes the file. Nothing is saved unless
+// you press Ctrl+S.
 //
-// This plugin renders nothing itself. QuickLook's own MarkdownViewer draws the
-// preview (table of contents, highlighting, diagrams) as before; for each
-// Markdown preview this plugin reaches its WebView2, adds QuickEdit.js to the
-// page, and handles the page's messages: it reads and writes the file, and
-// while you type it keeps QuickLook's keyboard hook from treating Space,
-// Enter, Esc and the arrows as "close" / "open" / "next file".
+// This plugin renders nothing itself. QuickLook's own viewers draw the preview
+// as before:
+//  - Markdown (MarkdownViewer): this plugin reaches the preview's WebView2,
+//    adds QuickEdit.js to the page, and handles the page's messages.
+//  - Plain text (TextViewer, an AvalonEdit editor): a double-click makes the
+//    editor writable; Esc makes it read-only again; Ctrl+S saves.
+// Either way, while you type it keeps QuickLook's keyboard hook from treating
+// Space, Enter, Esc and the arrows as "close" / "open" / "next file".
 //
 // The per-preview hook is the "..." menu getter, which QuickLook calls for
 // every plugin after the viewer has been created. Written in C# 5 so it builds
@@ -27,6 +29,7 @@ using System.Reflection;
 using System.Runtime.CompilerServices;
 using System.Text;
 using System.Windows;
+using System.Windows.Input;
 using System.Windows.Threading;
 
 namespace QuickLook.Plugin.QuickEdit
@@ -42,7 +45,7 @@ namespace QuickLook.Plugin.QuickEdit
             ".rmd", ".rmarkdown", ".apib", ".mdtxt", ".mdtext",
         };
 
-        private static readonly ConditionalWeakTable<object, Hook> Hooks = new ConditionalWeakTable<object, Hook>();
+        private static readonly ConditionalWeakTable<object, object> Hooks = new ConditionalWeakTable<object, object>();
         private static string _script;
         private static readonly HashSet<string> Logged = new HashSet<string>();
 
@@ -91,12 +94,9 @@ namespace QuickLook.Plugin.QuickEdit
             }
         }
 
-        // True when the current preview is a Markdown file this plugin edits.
+        // True when the current preview is a Markdown or text file this plugin edits.
         private static bool TryAttach()
         {
-            if (_script == null)
-                return false;
-
             var window = FindViewerWindow();
             if (window == null)
                 return false;
@@ -104,34 +104,45 @@ namespace QuickLook.Plugin.QuickEdit
             var path = GetField(window, "_path") as string;
             if (string.IsNullOrEmpty(path) || !File.Exists(path))
                 return false;
-            var ext = Path.GetExtension(path).ToLowerInvariant();
-            if (!Extensions.Contains(ext))
-                return false;
 
             var contextProperty = window.GetType().GetProperty("ContextObject", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
             var context = contextProperty == null ? null : contextProperty.GetValue(window, null) as ContextObject;
             var panel = context == null ? null : context.ViewerContent as FrameworkElement;
-            if (panel == null || !IsMarkdownPanel(panel.GetType()))
+            if (panel == null)
                 return false;
 
-            Hook existing;
+            object existing;
             if (Hooks.TryGetValue(panel, out existing))
                 return true;
 
-            var webView = GetField(panel, "_webView");
-            if (webView == null)
-                return false;                           // WebView2 missing: MarkdownViewer shows a download button
+            if (IsType(panel.GetType(), "QuickLook.Plugin.MarkdownViewer.MarkdownPanel"))
+            {
+                if (_script == null || !Extensions.Contains(Path.GetExtension(path).ToLowerInvariant()))
+                    return false;
+                var webView = GetField(panel, "_webView");
+                if (webView == null)
+                    return false;                       // WebView2 missing: MarkdownViewer shows a download button
+                var hook = new MarkdownHook(panel, webView, path);
+                Hooks.Add(panel, hook);
+                hook.Start();
+                return true;
+            }
 
-            var hook = new Hook(panel, webView, path);
-            Hooks.Add(panel, hook);
-            hook.Start();
-            return true;
+            if (IsType(panel.GetType(), "QuickLook.Plugin.TextViewer.TextViewerPanel"))
+            {
+                var hook = new TextHook(panel, context, path);
+                Hooks.Add(panel, hook);
+                hook.Start();
+                return true;
+            }
+
+            return false;
         }
 
-        private static bool IsMarkdownPanel(Type type)
+        private static bool IsType(Type type, string fullName)
         {
             for (var t = type; t != null; t = t.BaseType)
-                if (t.FullName == "QuickLook.Plugin.MarkdownViewer.MarkdownPanel")
+                if (t.FullName == fullName)
                     return true;
             return false;
         }
@@ -193,35 +204,46 @@ namespace QuickLook.Plugin.QuickEdit
             catch { }
         }
 
+        // Subscribe to an event of a type this assembly doesn't reference
+        // (WebView2, AvalonEdit), with a handler taking (object, object).
+        internal static void Subscribe(object target, string eventName, object handlerTarget, string method)
+        {
+            var info = target.GetType().GetEvent(eventName);
+            var handler = handlerTarget.GetType().GetMethod(method, BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
+            if (info == null || handler == null)
+            {
+                Log("event-" + eventName, "event " + eventName + " not found on " + target.GetType().FullName + ".");
+                return;
+            }
+            info.AddEventHandler(target, Delegate.CreateDelegate(info.EventHandlerType, handlerTarget, handler));
+        }
+
         internal static string Script { get { return _script; } }
     }
 
     // One Markdown preview: its WebView2, the file, and the page's messages.
-    internal class Hook
+    internal class MarkdownHook
     {
-        private static FieldInfo _tickField;
-        private static object _dispatcher;
-        private static bool _dispatcherLooked;
-
         private readonly FrameworkElement _panel;
         private readonly object _webView;
         private readonly string _path;
         private object _core;
         private byte[] _bytes;
         private Encoding _encoding;
-        private DispatcherTimer _quiet;
+        private readonly KeyGuard _guard;
 
-        public Hook(FrameworkElement panel, object webView, string path)
+        public MarkdownHook(FrameworkElement panel, object webView, string path)
         {
             _panel = panel;
             _webView = webView;
             _path = path;
+            _guard = new KeyGuard(panel);
         }
 
         public void Start()
         {
-            _panel.Unloaded += delegate { StopQuiet(); };
-            Subscribe(_webView, "NavigationCompleted", "OnNavigationCompleted");
+            _panel.Unloaded += delegate { _guard.Stop(); };
+            Plugin.Subscribe(_webView, "NavigationCompleted", this, "OnNavigationCompleted");
 
             object core = null;
             try { core = ((dynamic)_webView).CoreWebView2; }
@@ -229,19 +251,7 @@ namespace QuickLook.Plugin.QuickEdit
             if (core != null)
                 OnCore();
             else
-                Subscribe(_webView, "CoreWebView2InitializationCompleted", "OnInitialized");
-        }
-
-        private void Subscribe(object target, string eventName, string method)
-        {
-            var info = target.GetType().GetEvent(eventName);
-            var handler = typeof(Hook).GetMethod(method, BindingFlags.Instance | BindingFlags.NonPublic);
-            if (info == null || handler == null)
-            {
-                Plugin.Log("event-" + eventName, "WebView2 event " + eventName + " not found.");
-                return;
-            }
-            info.AddEventHandler(target, Delegate.CreateDelegate(info.EventHandlerType, this, handler));
+                Plugin.Subscribe(_webView, "CoreWebView2InitializationCompleted", this, "OnInitialized");
         }
 
         private void OnInitialized(object sender, object e)
@@ -265,7 +275,7 @@ namespace QuickLook.Plugin.QuickEdit
             catch { _core = null; }
             if (_core == null)
                 return;
-            Subscribe(_core, "WebMessageReceived", "OnMessage");
+            Plugin.Subscribe(_core, "WebMessageReceived", this, "OnMessage");
             Inject();
         }
 
@@ -296,9 +306,9 @@ namespace QuickLook.Plugin.QuickEdit
                 if (message == "hello")
                     SendFile();
                 else if (message == "editing:1")
-                    StartQuiet();
+                    _guard.Start();
                 else if (message == "editing:0")
-                    StopQuiet();
+                    _guard.Stop();
                 else if (message.StartsWith("save:", StringComparison.Ordinal))
                     Save(message.Substring(5));
             }
@@ -324,7 +334,7 @@ namespace QuickLook.Plugin.QuickEdit
             {
                 Post("nofile:Couldn't read the file: " + e.Message);
             }
-            if (!FindDispatcher())
+            if (!KeyGuard.Available)
                 Post("keys:missing");
         }
 
@@ -440,62 +450,272 @@ namespace QuickLook.Plugin.QuickEdit
             }
             return sb.ToString();
         }
+    }
 
-        // QuickLook ignores Space, Enter, Esc and the arrows for a second after
-        // any other key (KeystrokeDispatcher._lastInvalidKeyPressTick). Keeping
-        // that timestamp current while you type stops it from closing the
-        // preview, opening the file or switching files under you.
-        private static bool FindDispatcher()
+    // QuickLook ignores Space, Enter, Esc and the arrows for a second after any
+    // other key (KeystrokeDispatcher._lastInvalidKeyPressTick). Keeping that
+    // timestamp current while you type stops it from closing the preview,
+    // opening the file or switching files under you.
+    internal class KeyGuard
+    {
+        private static FieldInfo _tickField;
+        private static object _dispatcher;
+        private static bool _looked;
+
+        private readonly FrameworkElement _owner;
+        private DispatcherTimer _timer;
+
+        public KeyGuard(FrameworkElement owner)
         {
-            if (_dispatcherLooked)
-                return _dispatcher != null;
-            _dispatcherLooked = true;
-            try
+            _owner = owner;
+        }
+
+        public static bool Available
+        {
+            get
             {
-                var type = Plugin.FindType("QuickLook.KeystrokeDispatcher");
-                var instance = type == null ? null : Plugin.FindField(type, "_instance", BindingFlags.Static);
-                _tickField = type == null ? null : Plugin.FindField(type, "_lastInvalidKeyPressTick", BindingFlags.Instance);
-                _dispatcher = instance == null ? null : instance.GetValue(null);
-                if (_tickField == null || _tickField.FieldType != typeof(long))
+                if (_looked)
+                    return _dispatcher != null;
+                _looked = true;
+                try
+                {
+                    var type = Plugin.FindType("QuickLook.KeystrokeDispatcher");
+                    var instance = type == null ? null : Plugin.FindField(type, "_instance", BindingFlags.Static);
+                    _tickField = type == null ? null : Plugin.FindField(type, "_lastInvalidKeyPressTick", BindingFlags.Instance);
+                    _dispatcher = instance == null ? null : instance.GetValue(null);
+                    if (_tickField == null || _tickField.FieldType != typeof(long))
+                        _dispatcher = null;
+                }
+                catch
+                {
                     _dispatcher = null;
+                }
+                if (_dispatcher == null)
+                    Plugin.Log("keys", "QuickLook's keystroke dispatcher not found; Space and Enter may act on the preview while editing.");
+                return _dispatcher != null;
             }
-            catch
-            {
-                _dispatcher = null;
-            }
-            if (_dispatcher == null)
-                Plugin.Log("keys", "QuickLook's keystroke dispatcher not found; Space and Enter may act on the preview while editing.");
-            return _dispatcher != null;
         }
 
-        private void StartQuiet()
+        public void Start()
         {
-            if (!FindDispatcher())
+            if (!Available)
                 return;
-            if (_quiet == null)
+            if (_timer == null)
             {
-                _quiet = new DispatcherTimer(DispatcherPriority.Send, _panel.Dispatcher) { Interval = TimeSpan.FromMilliseconds(50) };
-                _quiet.Tick += delegate { Quiet(); };
+                _timer = new DispatcherTimer(DispatcherPriority.Send, _owner.Dispatcher) { Interval = TimeSpan.FromMilliseconds(50) };
+                _timer.Tick += delegate { Tick(); };
             }
-            Quiet();
-            _quiet.Start();
+            Tick();
+            _timer.Start();
         }
 
-        private void Quiet()
+        public void Stop()
         {
-            if (!_panel.IsVisible)
+            if (_timer != null)
+                _timer.Stop();
+        }
+
+        private void Tick()
+        {
+            if (!_owner.IsVisible)
             {
-                StopQuiet();
+                Stop();
                 return;
             }
             try { _tickField.SetValue(_dispatcher, DateTime.Now.Ticks); }
-            catch { StopQuiet(); }
+            catch { Stop(); }
+        }
+    }
+
+    // One plain text preview: TextViewer's AvalonEdit editor, read-only until a
+    // double-click. The title bar says when it is editable or unsaved.
+    internal class TextHook
+    {
+        private readonly FrameworkElement _panel;
+        private readonly ContextObject _context;
+        private readonly string _path;
+        private readonly KeyGuard _guard;
+        private string _title;
+        private bool _editing;
+        private bool _blocked;
+        private byte[] _bytes;
+        private Encoding _encoding;
+        private DispatcherTimer _flash;
+
+        public TextHook(FrameworkElement panel, ContextObject context, string path)
+        {
+            _panel = panel;
+            _context = context;
+            _path = path;
+            _guard = new KeyGuard(panel);
         }
 
-        private void StopQuiet()
+        public void Start()
         {
-            if (_quiet != null)
-                _quiet.Stop();
+            _panel.PreviewMouseLeftButtonDown += OnMouseDown;
+            _panel.PreviewKeyDown += OnKeyDown;
+            _panel.Unloaded += delegate { _guard.Stop(); };
+            Plugin.Subscribe(_panel, "TextChanged", this, "OnTextChanged");
+        }
+
+        private dynamic Editor { get { return _panel; } }
+
+        private void OnMouseDown(object sender, MouseButtonEventArgs e)
+        {
+            if (e.ClickCount == 2 && !_editing)
+                BeginEdit();                            // AvalonEdit still selects the word
+        }
+
+        private void BeginEdit()
+        {
+            try
+            {
+                if (_blocked)
+                {
+                    Flash("can't edit here: this preview isn't the file's exact text");
+                    return;
+                }
+                object document = Editor.Document;
+                if (document == null)
+                    return;                             // still loading
+                if (_bytes == null)
+                {
+                    string shown = Editor.Document.Text;
+                    Encoding encoding = Editor.Encoding;
+                    _encoding = encoding ?? Encoding.UTF8;
+                    _bytes = File.ReadAllBytes(_path);
+                    if (_encoding.GetString(_bytes) != shown)
+                    {
+                        // Over 5 MB (shown truncated) or converted for display.
+                        _blocked = true;
+                        _bytes = null;
+                        Flash("can't edit here: this preview isn't the file's exact text");
+                        return;
+                    }
+                    Editor.Document.UndoStack.MarkAsOriginalFile();
+                }
+                Editor.IsReadOnly = false;
+                _editing = true;
+                _guard.Start();
+                UpdateTitle();
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log("text-edit", "could not start editing: " + ex.Message);
+            }
+        }
+
+        private void EndEdit()
+        {
+            try { Editor.IsReadOnly = true; }
+            catch { }
+            _editing = false;
+            _guard.Stop();
+            UpdateTitle();
+        }
+
+        private void OnKeyDown(object sender, KeyEventArgs e)
+        {
+            var ctrl = (Keyboard.Modifiers & ModifierKeys.Control) != 0;
+            if (ctrl && e.Key == Key.S)
+            {
+                e.Handled = true;
+                Save();
+            }
+            else if (e.Key == Key.Escape && _editing)
+            {
+                e.Handled = true;                       // stop editing; a second Esc closes the preview
+                EndEdit();
+            }
+        }
+
+        private void OnTextChanged(object sender, object e)
+        {
+            UpdateTitle();
+        }
+
+        private bool Dirty
+        {
+            get
+            {
+                try { return _bytes != null && !(bool)Editor.Document.UndoStack.IsOriginalFile; }
+                catch { return false; }
+            }
+        }
+
+        private void Save()
+        {
+            if (_bytes == null || !Dirty)
+            {
+                if (_editing)
+                    EndEdit();
+                return;
+            }
+            try
+            {
+                string text = Editor.Document.Text;
+                var disk = File.ReadAllBytes(_path);
+                if (!disk.SequenceEqual(_bytes))
+                {
+                    Flash("not saved: the file changed on disk since it was opened");
+                    return;
+                }
+                var bytes = _encoding.GetBytes(text);
+                if (_encoding.GetString(bytes) != text)
+                {
+                    Flash("not saved: some characters can't be stored as " + _encoding.WebName);
+                    return;
+                }
+                File.WriteAllBytes(_path, bytes);
+                _bytes = bytes;
+                Editor.Document.UndoStack.MarkAsOriginalFile();
+                if (_editing)
+                    EndEdit();
+                Flash("saved");
+            }
+            catch (Exception ex)
+            {
+                Flash("not saved: " + ex.Message);
+            }
+        }
+
+        private string BaseTitle
+        {
+            get
+            {
+                if (_title == null)
+                    _title = _context.Title;
+                return _title;
+            }
+        }
+
+        private void UpdateTitle()
+        {
+            if (_flash != null && _flash.IsEnabled)
+                return;
+            var title = BaseTitle;
+            if (_editing)
+                title += Dirty ? "  ·  editing, unsaved: Ctrl+S saves, Esc stops" : "  ·  editing: Ctrl+S saves, Esc stops";
+            else if (Dirty)
+                title += "  ·  unsaved: Ctrl+S saves";
+            _context.Title = title;
+        }
+
+        // A message in the title bar for a few seconds.
+        private void Flash(string message)
+        {
+            _context.Title = BaseTitle + "  ·  " + message;
+            if (_flash == null)
+            {
+                _flash = new DispatcherTimer(DispatcherPriority.Normal, _panel.Dispatcher) { Interval = TimeSpan.FromSeconds(3) };
+                _flash.Tick += delegate
+                {
+                    _flash.Stop();
+                    UpdateTitle();
+                };
+            }
+            _flash.Stop();
+            _flash.Start();
         }
     }
 }
