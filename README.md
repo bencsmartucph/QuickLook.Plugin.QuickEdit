@@ -2,6 +2,8 @@
 
 A [QuickLook](https://github.com/QL-Win/QuickLook) plugin for changing a few words of a Markdown or plain text file without leaving its preview.
 
+**Why:** QuickLook previews are read-only, so fixing one typo you spot in a preview means opening the file in an editor, finding the spot again, and closing it.
+
 - **Double-click** any rendered text (a paragraph, heading, list item, table cell, quote or code block) and type. Double-clicking a word selects it, so typing replaces it.
 - **Enter** or clicking elsewhere finishes the edit. **Esc** cancels it.
 - **Enter at the end of a bullet** starts a new bullet below it, with the same indent and marker (numbered lists count on). Press Enter on the empty new bullet to stop. **Enter at the end of a paragraph or heading** starts a new paragraph.
@@ -62,6 +64,7 @@ No .NET SDK needed. `build.ps1` compiles with the C# compiler that ships with th
   A QuickLook release that renames one of these turns that part off, and QuickLook's log says which. Tested on QuickLook 4.5.0.
 - A block containing math or a Mermaid diagram can't be edited.
 - Markdown editing covers `.md`, `.markdown` and the other extensions QuickLook's Markdown viewer reads, except `.mermaid` and `.mmd`. Text editing needs QuickLook's text viewer (`TextViewerPanel`).
+- In a plain text file, the second Esc (the one that closes the preview) is ignored if it comes within about half a second of the Esc that stopped editing. Press it again.
 
 ## License
 
