@@ -2,8 +2,7 @@
 
 Change a few words of a Markdown or plain text file right in its [QuickLook](https://github.com/QL-Win/QuickLook) preview: double-click, type, <kbd>Ctrl</kbd>+<kbd>S</kbd>. No editor opens.
 
-<!-- Recording: save it as docs/quickedit.gif (under 5 MB), then uncomment the next line. -->
-<!-- <p align="center"><img src="docs/quickedit.gif" width="720" alt="A Markdown preview in QuickLook: a double-click on a word, the word retyped, Ctrl+S, and the corner note says it's saved."></p> -->
+<p align="center"><img src="docs/quickedit.gif" width="560" alt="A Markdown preview in QuickLook: the bold word 'corner' double-clicked and retyped as 'farm', a new bullet added under 'oat milk', Ctrl+S, and the corner note says Saved."></p>
 
 **Why:** QuickLook previews are read-only, so fixing one typo you spot in a preview means opening the file in an editor, finding the spot again, and closing it.
 
